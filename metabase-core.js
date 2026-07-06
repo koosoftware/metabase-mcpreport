@@ -88,10 +88,10 @@ export const CARDS = {
 // --- Summarizers -------------------------------------------------------------
 // Turn raw Metabase rows into a small digest the model can reason over.
 
-function tally(rows, key) {
+function tally(rows, key, nullLabel = "(null)") {
   const out = {};
   for (const r of rows) {
-    const k = r?.[key] ?? "(null)";
+    const k = r?.[key] ?? nullLabel;
     out[k] = (out[k] || 0) + 1;
   }
   return out;
@@ -209,8 +209,8 @@ function summarizeTicketRows(rows, opts = {}) {
     by_status: tally(rows, "Status"),
     by_service: tally(rows, "ServiceName"),
     by_branch: tally(rows, "BranchName"),
-    // Counter is null until a ticket is called, so "(null)" = not-yet-served.
-    by_counter: tally(rows, "CounterName"),
+    // Counter is null until a ticket is called — bucket those as not-called-yet.
+    by_counter: tally(rows, "CounterName", "(not called yet)"),
     by_attendance_mode: tally(rows, "AttendanceMode"),
     // BusinessDate is the operational queue day (differs from CheckedInAtUtc and
     // stays within the requested range), so it's the correct date grouping.
