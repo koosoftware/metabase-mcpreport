@@ -124,18 +124,43 @@ function minutesBetween(a, b) {
   return m >= 0 ? m : null; // ignore negative (clock/order anomalies)
 }
 
+function round1(n) {
+  return n == null ? null : Math.round(n * 10) / 10;
+}
+
 function durationStats(values) {
   const v = values.filter((x) => x != null).sort((a, b) => a - b);
   if (!v.length) return { count: 0 };
   const sum = v.reduce((a, b) => a + b, 0);
-  const round = (n) => Math.round(n * 10) / 10;
   return {
     count: v.length,
-    avg_min: round(sum / v.length),
-    median_min: round(v[Math.floor(v.length / 2)]),
-    min_min: round(v[0]),
-    max_min: round(v[v.length - 1]),
+    avg_min: round1(sum / v.length),
+    median_min: round1(v[Math.floor(v.length / 2)]),
+    min_min: round1(v[0]),
+    max_min: round1(v[v.length - 1]),
   };
+}
+
+/**
+ * Build a compact per-ticket-service detail table (human fields + computed
+ * waiting/serving minutes) — used to answer "list all tickets with their times".
+ * One entry per service row, so multi-service tickets appear more than once.
+ */
+function ticketDetail(rows, cap) {
+  const list = rows.slice(0, cap).map((r) => ({
+    ticket: r.TicketText,
+    service: r.ServiceName ?? null,
+    counter: r.CounterName ?? null,
+    status: r.Status,
+    business_date: r.BusinessDate ?? null,
+    issued: r.IssuedAtUtc ?? null,
+    checked_in: r.CheckedInAtUtc ?? null,
+    called: r.CalledAtUtc ?? null,
+    completed: r.CompletedAtUtc ?? null,
+    waiting_min: round1(minutesBetween(r.CheckedInAtUtc, r.CalledAtUtc)),
+    serving_min: round1(minutesBetween(r.CalledAtUtc, r.CompletedAtUtc)),
+  }));
+  return { count: rows.length, rows: list, truncated: rows.length > cap };
 }
 
 /**
@@ -154,7 +179,7 @@ function durationStats(values) {
  *    Median is the reliable figure; avg/max are skewed by tickets left open for
  *    days in the data, so both are reported for transparency.
  */
-function summarizeTicketRows(rows) {
+function summarizeTicketRows(rows, opts = {}) {
   if (!Array.isArray(rows)) return { note: "unexpected (non-array) response", raw: rows };
   if (!rows.length) return { service_rows: 0, note: "no rows for this range" };
 
@@ -163,7 +188,13 @@ function summarizeTicketRows(rows) {
 
   const first = rows[0] || {};
 
-  return {
+  // Distinct ticket labels (e.g. "G0001", "V0002") so the model can answer
+  // "list the ticket numbers" without pulling every raw row. Capped to keep the
+  // payload small; if truncated, the model can narrow the range or use include_rows.
+  const TICKET_CAP = 300;
+  const ticketTexts = [...new Set(rows.map((r) => r.TicketText).filter(Boolean))].sort();
+
+  const out = {
     // Human-readable context (names now come back in the query).
     context: {
       company: first.CompanyName || first.CompanyCode || null,
@@ -184,9 +215,20 @@ function summarizeTicketRows(rows) {
     // BusinessDate is the operational queue day (differs from CheckedInAtUtc and
     // stays within the requested range), so it's the correct date grouping.
     by_business_date: tally(rows, "BusinessDate"),
+    ticket_numbers: {
+      count: ticketTexts.length,
+      list: ticketTexts.slice(0, TICKET_CAP),
+      truncated: ticketTexts.length > TICKET_CAP,
+    },
     waiting_minutes: durationStats(waiting),
     serving_minutes: durationStats(serving),
   };
+
+  // Per-ticket detail (issued/called/completed/waiting/serving per row) is only
+  // included when explicitly requested, to keep the default summary compact.
+  if (opts.detail) out.tickets = ticketDetail(rows, opts.detailCap || 200);
+
+  return out;
 }
 
 // --- Metabase parameter builder ---------------------------------------------
@@ -332,7 +374,7 @@ export async function fetchCard(cardKey, card, opts = {}) {
   // a compact digest so the small LLM isn't flooded. Include a few sample rows
   // for context, and the full rows only when explicitly requested.
   if (card.summarize) {
-    out.summary = card.summarize(rows);
+    out.summary = card.summarize(rows, opts);
     out.sampleRows = Array.isArray(rows) ? rows.slice(0, 3) : rows;
     if (opts.include_rows) out.rows = rows;
   } else {

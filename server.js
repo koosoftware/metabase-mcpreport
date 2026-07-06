@@ -33,10 +33,12 @@ function jsonContent(obj) {
 server.tool(
   "get_report",
   "Fetch a QMSCloud report from Metabase and analyze it to answer the user's " +
-    "question. Returns a compact `summary` (counts by status/mode/source, per-day " +
-    "totals, distinct tickets, waiting/serving-time stats) plus a few `sampleRows`. " +
-    "Pass the exact `report` key (call list_reports if unsure). Supply `start_date` " +
-    "and `end_date` as YYYY-MM-DD based on the user's intent (defaults to current " +
+    "question. Returns a compact `summary` (distinct tickets; breakdowns by status, " +
+    "service, branch, counter, business date; a `ticket_numbers` list; and waiting/" +
+    "serving-time stats) plus a few `sampleRows`. For questions that require listing " +
+    "individual tickets WITH their times, pass detail=true to also get a per-ticket " +
+    "table. Pass the exact `report` key (call list_reports if unsure). Supply " +
+    "`start_date`/`end_date` as YYYY-MM-DD from the user's intent (defaults to current " +
     "month-to-date). The tenant (company/branch) is resolved automatically from the " +
     "workspace — do not ask the user for it. Currently available: 'ticket_summary'.",
   {
@@ -51,10 +53,14 @@ server.tool(
       .string()
       .optional()
       .describe("End date YYYY-MM-DD. Defaults to today."),
+    detail: z
+      .boolean()
+      .optional()
+      .describe("Set true when the user wants to LIST individual tickets with their times (issued/called/completed, waiting/serving minutes). Adds a compact `summary.tickets` table. Default false (aggregates only)."),
     include_rows: z
       .boolean()
       .optional()
-      .describe("Rarely needed. If true, also returns every raw row (can be large). Default false — the summary usually suffices."),
+      .describe("Rarely needed. If true, also returns every raw row with all columns (large, GUID-heavy). Prefer `detail` for per-ticket listing. Default false."),
     workspace_slug: z
       .string()
       .describe(
@@ -63,7 +69,7 @@ server.tool(
           "user for it and do not set it yourself."
       ),
   },
-  async ({ report, start_date = "", end_date = "", include_rows = false, workspace_slug }) => {
+  async ({ report, start_date = "", end_date = "", detail = false, include_rows = false, workspace_slug }) => {
     const card = CARDS[report];
     if (!card) {
       return jsonContent({
@@ -92,7 +98,7 @@ server.tool(
     }
 
     try {
-      const result = await fetchCard(report, card, { start_date: from, end_date: to, tenant, include_rows });
+      const result = await fetchCard(report, card, { start_date: from, end_date: to, tenant, detail, include_rows });
       return jsonContent({ ...result, start_date: from, end_date: to });
     } catch (e) {
       return jsonContent({ error: "request_failed", message: String(e?.message || e) });
