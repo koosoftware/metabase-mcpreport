@@ -142,9 +142,10 @@ function durationStats(values) {
  * Aggregate raw ticket-service rows from card 40 into a compact summary.
  *
  * Row columns (current query): TicketServiceId, CompanyId/Code/Name,
- * BranchId/Code/Name, QueueSessionId, TicketId, ServiceId/Code/Name, CounterId,
- * Status, SequenceNo, AttendanceMode, AttendanceRequired, CheckedInAtUtc,
- * CalledAtUtc, CompletedAtUtc, BusinessDate, TicketNo, TicketText.
+ * BranchId/Code/Name, QueueSessionId, TicketId, ServiceId/Code/Name,
+ * CounterId/Code/Name, Status, SequenceNo, AttendanceMode, AttendanceRequired,
+ * IssuedAtUtc, CheckedInAtUtc, CalledAtUtc, CompletedAtUtc, BusinessDate,
+ * TicketNo, TicketText. (CounterId/Code/Name are null until a ticket is called.)
  *
  * NOTE on definitions (tune with the user):
  *  - A "ticket" = distinct TicketId. Multi-service tickets have several rows.
@@ -173,9 +174,12 @@ function summarizeTicketRows(rows) {
     distinct_queue_sessions: distinctCount(rows, "QueueSessionId"),
     distinct_services: distinctCount(rows, "ServiceId"),
     distinct_branches: distinctCount(rows, "BranchId"),
+    distinct_counters: distinctCount(rows, "CounterId"),
     by_status: tally(rows, "Status"),
     by_service: tally(rows, "ServiceName"),
     by_branch: tally(rows, "BranchName"),
+    // Counter is null until a ticket is called, so "(null)" = not-yet-served.
+    by_counter: tally(rows, "CounterName"),
     by_attendance_mode: tally(rows, "AttendanceMode"),
     // BusinessDate is the operational queue day (differs from CheckedInAtUtc and
     // stays within the requested range), so it's the correct date grouping.
