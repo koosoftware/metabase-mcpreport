@@ -114,6 +114,16 @@ function tallyDate(rows, key) {
   return out;
 }
 
+/**
+ * Real completion timestamp — only tickets whose Status is "Completed" have a
+ * genuine CompletedAtUtc. Every other status carries a placeholder/sentinel
+ * value (observed: 2026-06-17T15:34:46.743), so treating it as a completion
+ * inflates serving time by thousands of minutes. Gate on Status.
+ */
+function completedAt(r) {
+  return r?.Status === "Completed" ? r.CompletedAtUtc ?? null : null;
+}
+
 /** minutes between two ISO timestamps, or null if either missing/invalid. */
 function minutesBetween(a, b) {
   if (!a || !b) return null;
@@ -124,21 +134,61 @@ function minutesBetween(a, b) {
   return m >= 0 ? m : null; // ignore negative (clock/order anomalies)
 }
 
-function round1(n) {
-  return n == null ? null : Math.round(n * 10) / 10;
+/** seconds between two ISO timestamps, or null. Queue times are short, so we
+ * report in whole seconds — reporting in 1-decimal minutes lost precision (e.g.
+ * a true 55.8s average displayed as 0.9 min, which reads back as 54s). */
+function secondsBetween(a, b) {
+  const m = minutesBetween(a, b);
+  return m == null ? null : m * 60;
+}
+
+function roundOrNull(n) {
+  return n == null ? null : Math.round(n);
 }
 
 function durationStats(values) {
+  // values are in SECONDS
   const v = values.filter((x) => x != null).sort((a, b) => a - b);
   if (!v.length) return { count: 0 };
   const sum = v.reduce((a, b) => a + b, 0);
+  const r = (n) => Math.round(n);
   return {
     count: v.length,
-    avg_min: round1(sum / v.length),
-    median_min: round1(v[Math.floor(v.length / 2)]),
-    min_min: round1(v[0]),
-    max_min: round1(v[v.length - 1]),
+    avg_sec: r(sum / v.length),
+    median_sec: r(v[Math.floor(v.length / 2)]),
+    min_sec: r(v[0]),
+    max_sec: r(v[v.length - 1]),
   };
+}
+
+/**
+ * Core metrics for a set of rows (counts, completion rate, waiting/serving
+ * seconds). Reused for per-group breakdowns (e.g. by service).
+ */
+function groupMetrics(rows) {
+  const completedRows = rows.filter((r) => r.Status === "Completed");
+  const pct = (n, d) => (d ? Math.round((n / d) * 1000) / 10 : 0);
+  const waiting = rows.map((r) => secondsBetween(r.CheckedInAtUtc, r.CalledAtUtc));
+  const serving = rows.map((r) => secondsBetween(r.CalledAtUtc, completedAt(r)));
+  return {
+    service_rows: rows.length,
+    by_status: tally(rows, "Status"),
+    completion: {
+      completed_rows: completedRows.length,
+      total_rows: rows.length,
+      rate_by_row_pct: pct(completedRows.length, rows.length),
+    },
+    waiting_time: durationStats(waiting),
+    serving_time: durationStats(serving),
+  };
+}
+
+/** Group rows by a column and compute groupMetrics for each value. */
+function metricsByColumn(rows, key) {
+  const values = [...new Set(rows.map((r) => r?.[key]).filter(Boolean))];
+  const out = {};
+  for (const v of values) out[v] = groupMetrics(rows.filter((r) => r?.[key] === v));
+  return out;
 }
 
 /**
@@ -156,9 +206,11 @@ function ticketDetail(rows, cap) {
     issued: r.IssuedAtUtc ?? null,
     checked_in: r.CheckedInAtUtc ?? null,
     called: r.CalledAtUtc ?? null,
-    completed: r.CompletedAtUtc ?? null,
-    waiting_min: round1(minutesBetween(r.CheckedInAtUtc, r.CalledAtUtc)),
-    serving_min: round1(minutesBetween(r.CalledAtUtc, r.CompletedAtUtc)),
+    // Only show a completion time (and serving time) when actually Completed;
+    // other statuses carry a placeholder CompletedAtUtc.
+    completed: completedAt(r),
+    waiting_sec: roundOrNull(secondsBetween(r.CheckedInAtUtc, r.CalledAtUtc)),
+    serving_sec: roundOrNull(secondsBetween(r.CalledAtUtc, completedAt(r))),
   }));
   return { count: rows.length, rows: list, truncated: rows.length > cap };
 }
@@ -175,16 +227,19 @@ function ticketDetail(rows, cap) {
  * NOTE on definitions (tune with the user):
  *  - A "ticket" = distinct TicketId. Multi-service tickets have several rows.
  *  - Status breakdown is at the service-row level.
- *  - Waiting = CalledAtUtc - CheckedInAtUtc; Serving = CompletedAtUtc - CalledAtUtc.
- *    Median is the reliable figure; avg/max are skewed by tickets left open for
- *    days in the data, so both are reported for transparency.
+ *  - Waiting = CalledAtUtc - CheckedInAtUtc (any called ticket).
+ *  - Serving = CompletedAtUtc - CalledAtUtc, but ONLY for Status="Completed"
+ *    tickets — other statuses carry a placeholder CompletedAtUtc, so counting
+ *    them inflated serving time massively. See completedAt().
  */
 function summarizeTicketRows(rows, opts = {}) {
   if (!Array.isArray(rows)) return { note: "unexpected (non-array) response", raw: rows };
   if (!rows.length) return { service_rows: 0, note: "no rows for this range" };
 
-  const waiting = rows.map((r) => minutesBetween(r.CheckedInAtUtc, r.CalledAtUtc));
-  const serving = rows.map((r) => minutesBetween(r.CalledAtUtc, r.CompletedAtUtc));
+  // Durations in SECONDS (queue times are short; see secondsBetween()).
+  const waiting = rows.map((r) => secondsBetween(r.CheckedInAtUtc, r.CalledAtUtc));
+  // Serving time only for genuinely Completed tickets (see completedAt()).
+  const serving = rows.map((r) => secondsBetween(r.CalledAtUtc, completedAt(r)));
 
   const first = rows[0] || {};
 
@@ -194,6 +249,11 @@ function summarizeTicketRows(rows, opts = {}) {
   const TICKET_CAP = 300;
   const ticketTexts = [...new Set(rows.map((r) => r.TicketText).filter(Boolean))].sort();
 
+  // Completion rate at the service-row level: completed rows / all rows.
+  const pct = (num, den) => (den ? Math.round((num / den) * 1000) / 10 : 0);
+  const distinctTickets = distinctCount(rows, "TicketId");
+  const completedRows = rows.filter((r) => r.Status === "Completed");
+
   const out = {
     // Human-readable context (names now come back in the query).
     context: {
@@ -201,7 +261,7 @@ function summarizeTicketRows(rows, opts = {}) {
       branches: [...new Set(rows.map((r) => r.BranchName).filter(Boolean))],
     },
     service_rows: rows.length,
-    distinct_tickets: distinctCount(rows, "TicketId"),
+    distinct_tickets: distinctTickets,
     distinct_queue_sessions: distinctCount(rows, "QueueSessionId"),
     distinct_services: distinctCount(rows, "ServiceId"),
     distinct_branches: distinctCount(rows, "BranchId"),
@@ -215,13 +275,20 @@ function summarizeTicketRows(rows, opts = {}) {
     // BusinessDate is the operational queue day (differs from CheckedInAtUtc and
     // stays within the requested range), so it's the correct date grouping.
     by_business_date: tally(rows, "BusinessDate"),
+    completion: {
+      completed_rows: completedRows.length,
+      total_rows: rows.length,
+      rate_by_row_pct: pct(completedRows.length, rows.length),
+    },
     ticket_numbers: {
       count: ticketTexts.length,
       list: ticketTexts.slice(0, TICKET_CAP),
       truncated: ticketTexts.length > TICKET_CAP,
     },
-    waiting_minutes: durationStats(waiting),
-    serving_minutes: durationStats(serving),
+    waiting_time: durationStats(waiting),
+    serving_time: durationStats(serving),
+    // Same metrics broken down per service.
+    by_service_metrics: metricsByColumn(rows, "ServiceName"),
   };
 
   // Per-ticket detail (issued/called/completed/waiting/serving per row) is only

@@ -70,8 +70,8 @@ try {
   console.log("\n=== CURRENT SUMMARY (what the model receives now) ===");
   console.log(JSON.stringify(result.summary, null, 2));
 
-  console.log("\n=== PER-TICKET DETAIL (first 5 of", result.summary?.tickets?.count, ") ===");
-  console.log(JSON.stringify(result.summary?.tickets?.rows?.slice(0, 5), null, 2));
+  console.log("\n=== PER-TICKET DETAIL (all", result.summary?.tickets?.count, "rows) ===");
+  console.log(JSON.stringify(result.summary?.tickets?.rows, null, 2));
 } catch (e) {
   console.error("ERROR:", e?.message || e);
   if (e?.cause) console.error("CAUSE:", e.cause.code || e.cause.name, e.cause.message);
