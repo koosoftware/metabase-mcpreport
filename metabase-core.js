@@ -103,6 +103,17 @@ function distinctCount(rows, key) {
   return s.size;
 }
 
+/** Tally by the date part (YYYY-MM-DD) of a timestamp column. */
+function tallyDate(rows, key) {
+  const out = {};
+  for (const r of rows) {
+    const v = r?.[key];
+    const d = typeof v === "string" && v.length >= 10 ? v.slice(0, 10) : "(none)";
+    out[d] = (out[d] || 0) + 1;
+  }
+  return out;
+}
+
 /** minutes between two ISO timestamps, or null if either missing/invalid. */
 function minutesBetween(a, b) {
   if (!a || !b) return null;
@@ -129,27 +140,45 @@ function durationStats(values) {
 
 /**
  * Aggregate raw ticket-service rows from card 40 into a compact summary.
- * NOTE on definitions (tune these with the user):
+ *
+ * Row columns (current query): TicketServiceId, CompanyId/Code/Name,
+ * BranchId/Code/Name, QueueSessionId, TicketId, ServiceId/Code/Name, CounterId,
+ * Status, SequenceNo, AttendanceMode, AttendanceRequired, CheckedInAtUtc,
+ * CalledAtUtc, CompletedAtUtc, BusinessDate, TicketNo, TicketText.
+ *
+ * NOTE on definitions (tune with the user):
  *  - A "ticket" = distinct TicketId. Multi-service tickets have several rows.
- *  - Status/mode/source breakdowns are at the service-row level.
+ *  - Status breakdown is at the service-row level.
  *  - Waiting = CalledAtUtc - CheckedInAtUtc; Serving = CompletedAtUtc - CalledAtUtc.
+ *    Median is the reliable figure; avg/max are skewed by tickets left open for
+ *    days in the data, so both are reported for transparency.
  */
 function summarizeTicketRows(rows) {
   if (!Array.isArray(rows)) return { note: "unexpected (non-array) response", raw: rows };
+  if (!rows.length) return { service_rows: 0, note: "no rows for this range" };
 
   const waiting = rows.map((r) => minutesBetween(r.CheckedInAtUtc, r.CalledAtUtc));
   const serving = rows.map((r) => minutesBetween(r.CalledAtUtc, r.CompletedAtUtc));
 
+  const first = rows[0] || {};
+
   return {
+    // Human-readable context (names now come back in the query).
+    context: {
+      company: first.CompanyName || first.CompanyCode || null,
+      branches: [...new Set(rows.map((r) => r.BranchName).filter(Boolean))],
+    },
     service_rows: rows.length,
     distinct_tickets: distinctCount(rows, "TicketId"),
     distinct_queue_sessions: distinctCount(rows, "QueueSessionId"),
     distinct_services: distinctCount(rows, "ServiceId"),
     distinct_branches: distinctCount(rows, "BranchId"),
     by_status: tally(rows, "Status"),
-    by_ticket_mode: tally(rows, "TicketMode"),
-    by_source_type: tally(rows, "SourceType"),
-    by_issue_source: tally(rows, "IssueSource"),
+    by_service: tally(rows, "ServiceName"),
+    by_branch: tally(rows, "BranchName"),
+    by_attendance_mode: tally(rows, "AttendanceMode"),
+    // BusinessDate is the operational queue day (differs from CheckedInAtUtc and
+    // stays within the requested range), so it's the correct date grouping.
     by_business_date: tally(rows, "BusinessDate"),
     waiting_minutes: durationStats(waiting),
     serving_minutes: durationStats(serving),
