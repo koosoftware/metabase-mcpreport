@@ -66,21 +66,32 @@ export function splitWorkspaceSlug(slug) {
   return { companyCode: s.slice(0, i), branchCode: s.slice(i + SEP.length) || null };
 }
 
-/** Find a CompanyId whose slugified CompanyCode equals companySlug (already slugified). */
+/** Find the company row whose slugified CompanyCode equals companySlug. */
+export function matchCompany(companies, companySlug) {
+  return companies.find((c) => slugify(c.CompanyCode) === companySlug) || null;
+}
+
+/** Convenience: the matched CompanyId (or null). */
 export function matchCompanyId(companies, companySlug) {
-  const m = companies.find((c) => slugify(c.CompanyCode) === companySlug);
-  return m ? m.CompanyId : null;
+  return matchCompany(companies, companySlug)?.CompanyId ?? null;
 }
 
 /**
- * Find a BranchId whose slugified BranchCode equals branchSlug AND that belongs
- * to companyId (branch codes can repeat across companies, so scope by company).
+ * Find the branch row whose slugified BranchCode equals branchSlug AND that
+ * belongs to companyId (branch codes can repeat across companies, so scope by
+ * company).
  */
-export function matchBranchId(branches, branchSlug, companyId) {
-  const m = branches.find(
-    (b) => slugify(b.BranchCode) === branchSlug && b.CompanyId === companyId
+export function matchBranch(branches, branchSlug, companyId) {
+  return (
+    branches.find(
+      (b) => slugify(b.BranchCode) === branchSlug && b.CompanyId === companyId
+    ) || null
   );
-  return m ? m.BranchId : null;
+}
+
+/** Convenience: the matched BranchId (or null). */
+export function matchBranchId(branches, branchSlug, companyId) {
+  return matchBranch(branches, branchSlug, companyId)?.BranchId ?? null;
 }
 
 // TTL cache per lookup card id.
@@ -115,18 +126,22 @@ export async function resolveWorkspace(workspaceSlug) {
   }
 
   const companies = await getLookupRows(COMPANY_CARD_ID);
-  const company_id = matchCompanyId(companies, companySlug);
-  if (!company_id) throw new Error(`invalid company code '${companyCode}'.`);
+  const company = matchCompany(companies, companySlug);
+  if (!company) throw new Error(`invalid company code '${companyCode}'.`);
+
+  // Timezone for display: use the company's, overridden by the branch's if set.
+  let time_zone = company.TimeZoneId || "UTC";
 
   // No branch part -> whole-company view (branch_id omitted downstream).
-  if (!branchCode) return { company_id };
+  if (!branchCode) return { company_id: company.CompanyId, time_zone };
 
   const branchSlug = slugify(branchCode);
   const branches = await getLookupRows(BRANCH_CARD_ID);
-  const branch_id = matchBranchId(branches, branchSlug, company_id);
-  if (!branch_id) throw new Error(`invalid branch code '${branchCode}'.`);
+  const branch = matchBranch(branches, branchSlug, company.CompanyId);
+  if (!branch) throw new Error(`invalid branch code '${branchCode}'.`);
+  if (branch.TimeZoneId) time_zone = branch.TimeZoneId;
 
-  return { company_id, branch_id };
+  return { company_id: company.CompanyId, branch_id: branch.BranchId, time_zone };
 }
 
 // --- Card catalog ------------------------------------------------------------
@@ -204,6 +219,23 @@ function minutesBetween(a, b) {
   return m >= 0 ? m : null; // ignore negative (clock/order anomalies)
 }
 
+/**
+ * Format a UTC timestamp string in a given IANA timezone as "YYYY-MM-DD HH:mm:ss".
+ * The DB timestamps have no "Z" suffix but ARE UTC, so we append "Z" to parse
+ * them as UTC before converting. Falls back to the raw string on any problem.
+ */
+function formatInTz(utcIso, timeZone) {
+  if (!utcIso) return null;
+  const d = new Date(/[zZ]|[+-]\d{2}:?\d{2}$/.test(utcIso) ? utcIso : utcIso + "Z");
+  if (Number.isNaN(d.getTime())) return utcIso;
+  try {
+    // "sv-SE" renders as ISO-like "2026-06-11 17:06:33".
+    return d.toLocaleString("sv-SE", { timeZone: timeZone || "UTC" });
+  } catch {
+    return utcIso; // unknown timezone -> leave as UTC
+  }
+}
+
 /** seconds between two ISO timestamps, or null. Queue times are short, so we
  * report in whole seconds — reporting in 1-decimal minutes lost precision (e.g.
  * a true 55.8s average displayed as 0.9 min, which reads back as 54s). */
@@ -263,22 +295,23 @@ function metricsByColumn(rows, key) {
 
 /**
  * Build a compact per-ticket-service detail table (human fields + computed
- * waiting/serving minutes) — used to answer "list all tickets with their times".
+ * waiting/serving seconds) — used to answer "list all tickets with their times".
+ * Timestamps are converted from UTC to `timeZone` for display.
  * One entry per service row, so multi-service tickets appear more than once.
  */
-function ticketDetail(rows, cap) {
+function ticketDetail(rows, cap, timeZone) {
   const list = rows.slice(0, cap).map((r) => ({
     ticket: r.TicketText,
     service: r.ServiceName ?? null,
     counter: r.CounterName ?? null,
     status: r.Status,
     business_date: r.BusinessDate ?? null,
-    issued: r.IssuedAtUtc ?? null,
-    checked_in: r.CheckedInAtUtc ?? null,
-    called: r.CalledAtUtc ?? null,
+    issued: formatInTz(r.IssuedAtUtc, timeZone),
+    checked_in: formatInTz(r.CheckedInAtUtc, timeZone),
+    called: formatInTz(r.CalledAtUtc, timeZone),
     // Only show a completion time (and serving time) when actually Completed;
     // other statuses carry a placeholder CompletedAtUtc.
-    completed: completedAt(r),
+    completed: formatInTz(completedAt(r), timeZone),
     waiting_sec: roundOrNull(secondsBetween(r.CheckedInAtUtc, r.CalledAtUtc)),
     serving_sec: roundOrNull(secondsBetween(r.CalledAtUtc, completedAt(r))),
   }));
@@ -312,6 +345,7 @@ function summarizeTicketRows(rows, opts = {}) {
   const serving = rows.map((r) => secondsBetween(r.CalledAtUtc, completedAt(r)));
 
   const first = rows[0] || {};
+  const timeZone = opts.tenant?.time_zone || "UTC";
 
   // Distinct ticket labels (e.g. "G0001", "V0002") so the model can answer
   // "list the ticket numbers" without pulling every raw row. Capped to keep the
@@ -330,6 +364,8 @@ function summarizeTicketRows(rows, opts = {}) {
       company: first.CompanyName || first.CompanyCode || null,
       branches: [...new Set(rows.map((r) => r.BranchName).filter(Boolean))],
     },
+    // Timezone that the detail table's timestamps are shown in.
+    time_zone: timeZone,
     service_rows: rows.length,
     distinct_tickets: distinctTickets,
     distinct_queue_sessions: distinctCount(rows, "QueueSessionId"),
@@ -363,7 +399,7 @@ function summarizeTicketRows(rows, opts = {}) {
 
   // Per-ticket detail (issued/called/completed/waiting/serving per row) is only
   // included when explicitly requested, to keep the default summary compact.
-  if (opts.detail) out.tickets = ticketDetail(rows, opts.detailCap || 200);
+  if (opts.detail) out.tickets = ticketDetail(rows, opts.detailCap || 200, timeZone);
 
   return out;
 }
