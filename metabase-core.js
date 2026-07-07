@@ -29,34 +29,103 @@ export const METABASE_BASE_URL =
 //   export METABASE_API_KEY='mb_...'
 export const METABASE_API_KEY = process.env.METABASE_API_KEY || "";
 
-// --- Workspace -> tenant routing --------------------------------------------
-// AnythingLLM injects `workspace_slug` on every call. Each slug maps to a
-// QMSCloud tenant: a required company_id and an optional branch_id. When a slug
-// has no branch_id, we simply omit that parameter from the Metabase request.
-//
-// Add new workspaces here as they are created. Any slug not listed is rejected
-// with an "invalid workspace slug" response.
-export const WORKSPACE_MAP = {
-  demo: {
-    company_id: "4f1589c0-5f9e-4f52-aee2-2b864204c14c",
-    // branch_id intentionally omitted (whole-company view)
-  },
-};
+// --- Workspace -> tenant routing (dynamic via Metabase) ---------------------
+// AnythingLLM injects `workspace_slug` on every call. The slug encodes the
+// tenant as "<companyCode>" or "<companyCode>_<branchCode>" — company and
+// branch are separated by the FIRST underscore, and the codes themselves are
+// hyphen-slugs (no underscores). Rather than hardcoding a map, we resolve
+// CompanyId / BranchId dynamically from Metabase lookup cards, so new companies
+// or branches need no code change here:
+//   card 41 -> companies (CompanyCode -> CompanyId)
+//   card 42 -> branches  (BranchCode + CompanyId -> BranchId)
+// Card IDs are overridable via env in case they differ per install.
+export const COMPANY_CARD_ID = Number(process.env.METABASE_COMPANY_CARD_ID || 41);
+export const BRANCH_CARD_ID = Number(process.env.METABASE_BRANCH_CARD_ID || 42);
+
+// Lookup lists are cached in memory with a short TTL so we don't hit Metabase
+// on every request; a newly-added company/branch appears within the TTL.
+const LOOKUP_TTL_MS = Number(process.env.METABASE_LOOKUP_TTL_MS || 300000);
 
 /**
- * Resolve a workspace_slug to { company_id, branch_id? }, or throw if unknown.
- * @param {string} workspaceSlug
- * @returns {{ company_id: string, branch_id?: string }}
+ * Lowercase, collapse any run of non-alphanumeric chars to a single hyphen, and
+ * trim hyphens. "DEMO"->"demo", "KL001"->"kl001", "BRANCH 001"->"branch-001".
  */
-export function resolveWorkspace(workspaceSlug) {
-  const tenant = WORKSPACE_MAP[workspaceSlug];
-  if (!tenant) {
-    const known = Object.keys(WORKSPACE_MAP).join(", ") || "(none configured)";
-    throw new Error(
-      `invalid workspace slug '${workspaceSlug}'. Known workspaces: ${known}.`
-    );
+export function slugify(s) {
+  return String(s ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+/** Split a workspace slug into { companyCode, branchCode } on the FIRST "_". */
+export function splitWorkspaceSlug(slug) {
+  const s = String(slug ?? "").trim();
+  const i = s.indexOf("_");
+  if (i === -1) return { companyCode: s, branchCode: null };
+  return { companyCode: s.slice(0, i), branchCode: s.slice(i + 1) || null };
+}
+
+/** Find a CompanyId whose slugified CompanyCode equals companySlug (already slugified). */
+export function matchCompanyId(companies, companySlug) {
+  const m = companies.find((c) => slugify(c.CompanyCode) === companySlug);
+  return m ? m.CompanyId : null;
+}
+
+/**
+ * Find a BranchId whose slugified BranchCode equals branchSlug AND that belongs
+ * to companyId (branch codes can repeat across companies, so scope by company).
+ */
+export function matchBranchId(branches, branchSlug, companyId) {
+  const m = branches.find(
+    (b) => slugify(b.BranchCode) === branchSlug && b.CompanyId === companyId
+  );
+  return m ? m.BranchId : null;
+}
+
+// TTL cache per lookup card id.
+const lookupCache = new Map(); // cardId -> { at, rows }
+async function getLookupRows(cardId) {
+  const now = Date.now();
+  const hit = lookupCache.get(cardId);
+  if (hit && now - hit.at < LOOKUP_TTL_MS) return hit.rows;
+  const rows = await postCardJson(cardId, { parameters: [] });
+  if (!Array.isArray(rows)) throw new Error(`Lookup card ${cardId} did not return a list.`);
+  lookupCache.set(cardId, { at: now, rows });
+  return rows;
+}
+
+/** Clear the lookup cache (e.g. to force a fresh fetch). */
+export function clearLookupCache() {
+  lookupCache.clear();
+}
+
+/**
+ * Resolve a workspace_slug to { company_id, branch_id? } by matching its
+ * CompanyCode/BranchCode against Metabase lookup cards. Throws a descriptive
+ * error for an unknown company or branch code.
+ * @param {string} workspaceSlug
+ * @returns {Promise<{ company_id: string, branch_id?: string }>}
+ */
+export async function resolveWorkspace(workspaceSlug) {
+  const { companyCode, branchCode } = splitWorkspaceSlug(workspaceSlug);
+  const companySlug = slugify(companyCode);
+  if (!companySlug) {
+    throw new Error(`invalid workspace slug '${workspaceSlug}': no company code found.`);
   }
-  return tenant;
+
+  const companies = await getLookupRows(COMPANY_CARD_ID);
+  const company_id = matchCompanyId(companies, companySlug);
+  if (!company_id) throw new Error(`invalid company code '${companyCode}'.`);
+
+  // No branch part -> whole-company view (branch_id omitted downstream).
+  if (!branchCode) return { company_id };
+
+  const branchSlug = slugify(branchCode);
+  const branches = await getLookupRows(BRANCH_CARD_ID);
+  const branch_id = matchBranchId(branches, branchSlug, company_id);
+  if (!branch_id) throw new Error(`invalid branch code '${branchCode}'.`);
+
+  return { company_id, branch_id };
 }
 
 // --- Card catalog ------------------------------------------------------------
@@ -392,15 +461,23 @@ function httpPostJson(urlStr, headers, bodyStr) {
   });
 }
 
-export async function fetchCard(cardKey, card, opts = {}) {
+/**
+ * POST a Metabase card query and return the parsed JSON rows. Shared by both the
+ * report cards and the company/branch lookup cards. Throws on missing key,
+ * transport error, non-2xx status, or non-JSON body.
+ * @param {number} cardId
+ * @param {object} bodyObj  request body, e.g. { parameters: [...] }
+ * @returns {Promise<any>}  parsed JSON (usually an array of row objects)
+ */
+async function postCardJson(cardId, bodyObj) {
   if (!METABASE_API_KEY) {
     throw new Error(
       "METABASE_API_KEY is not set. Add it to the AnythingLLM MCP `env` block " +
         "(or export it in your shell for local testing)."
     );
   }
-  const url = `${METABASE_BASE_URL}/api/card/${card.id}/query/json`;
-  const bodyStr = JSON.stringify(buildRequestBody(card, opts));
+  const url = `${METABASE_BASE_URL}/api/card/${cardId}/query/json`;
+  const bodyStr = JSON.stringify(bodyObj);
 
   let res;
   try {
@@ -415,24 +492,27 @@ export async function fetchCard(cardKey, card, opts = {}) {
     );
   } catch (e) {
     throw new Error(
-      `Metabase card ${card.id} request failed: ${e?.code ? e.code + " " : ""}${e?.message || e}`
+      `Metabase card ${cardId} request failed: ${e?.code ? e.code + " " : ""}${e?.message || e}`
     );
   }
 
   if (res.status < 200 || res.status >= 300) {
     throw new Error(
-      `Metabase card ${card.id} returned HTTP ${res.status}: ${res.text.slice(0, 500)}`
+      `Metabase card ${cardId} returned HTTP ${res.status}: ${res.text.slice(0, 500)}`
     );
   }
 
-  let rows;
   try {
-    rows = JSON.parse(res.text);
+    return JSON.parse(res.text);
   } catch {
     throw new Error(
-      `Metabase card ${card.id} did not return JSON: ${res.text.slice(0, 300)}`
+      `Metabase card ${cardId} did not return JSON: ${res.text.slice(0, 300)}`
     );
   }
+}
+
+export async function fetchCard(cardKey, card, opts = {}) {
+  const rows = await postCardJson(card.id, buildRequestBody(card, opts));
 
   const rowCount = Array.isArray(rows) ? rows.length : undefined;
   const out = { card: cardKey, cardId: card.id, rowCount };

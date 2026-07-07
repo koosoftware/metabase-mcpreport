@@ -28,7 +28,7 @@ function describeValue(v) {
 }
 
 try {
-  const tenant = resolveWorkspace(slug);
+  const tenant = await resolveWorkspace(slug);
   console.log(`workspace='${slug}' tenant=`, tenant);
   console.log(`range=${start_date} .. ${end_date}\n`);
 

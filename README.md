@@ -22,13 +22,22 @@ etc. will be added to the `CARDS` catalog in `metabase-core.js`.
 
 ## How it works
 
-1. AnythingLLM injects `workspace_slug` on every call.
-2. The slug maps to a tenant `{ company_id, branch_id? }` via `WORKSPACE_MAP`.
-   - `demo` → `company_id = 4f1589c0-5f9e-4f52-aee2-2b864204c14c` (no branch_id).
-   - Unknown slug → returns `invalid workspace slug`.
+1. AnythingLLM injects `workspace_slug` on every call. The slug encodes the
+   tenant as `<companyCode>` or `<companyCode>_<branchCode>` — split on the
+   **first** underscore (codes themselves are hyphen-slugs, e.g. `branch-001`).
+2. The server resolves the tenant **dynamically from Metabase** (no hardcoded
+   map), caching the lookups for 5 minutes:
+   - Company: POST card **41**, slugify each `CompanyCode`, match the company
+     part → `CompanyId`. No match → `invalid company code`.
+   - Branch (only if present): POST card **42**, slugify each `BranchCode`,
+     match the branch part **and** `CompanyId` (branch codes repeat across
+     companies) → `BranchId`. No match → `invalid branch code`.
+   - So `demo` → DEMO company, whole-company view; `demo_kl001` → DEMO + KL001
+     branch; `qc_branch-001` → QC + Branch 1. New companies/branches work with
+     no code change.
 3. The model supplies `start_date` / `end_date` from the user's intent.
 4. The server POSTs the Metabase `parameters` array (start_date, end_date,
-   company_id, and branch_id when present) to the card and returns the rows.
+   company_id, and branch_id when present) to the ticket card and returns rows.
 
 ## 1. Install
 
@@ -83,7 +92,9 @@ control). Set it in the `env` block above. `METABASE_BASE_URL` defaults to
 
 ## Configuration reference
 
-- `WORKSPACE_MAP` (metabase-core.js) — slug → `{ company_id, branch_id? }`.
+- Tenant resolution is dynamic (cards 41/42) — no slug map to maintain. Env
+  overrides: `METABASE_COMPANY_CARD_ID` (41), `METABASE_BRANCH_CARD_ID` (42),
+  `METABASE_LOOKUP_TTL_MS` (300000). Test with `node test-lookup-cards.js`.
 - `CARDS` (metabase-core.js) — report key → Metabase card id + params.
 
 ## Notes

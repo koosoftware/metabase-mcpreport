@@ -79,10 +79,11 @@ server.tool(
       });
     }
 
-    // Resolve tenant (company_id / branch_id) from the workspace slug.
+    // Resolve tenant (company_id / branch_id) from the workspace slug — looked
+    // up dynamically against Metabase (cards 41/42), cached with a short TTL.
     let tenant;
     try {
-      tenant = resolveWorkspace(workspace_slug);
+      tenant = await resolveWorkspace(workspace_slug);
     } catch (e) {
       return jsonContent({ error: "invalid_workspace", message: String(e?.message || e) });
     }
