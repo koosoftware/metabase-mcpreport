@@ -31,9 +31,9 @@ export const METABASE_API_KEY = process.env.METABASE_API_KEY || "";
 
 // --- Workspace -> tenant routing (dynamic via Metabase) ---------------------
 // AnythingLLM injects `workspace_slug` on every call. The slug encodes the
-// tenant as "<companyCode>" or "<companyCode>_<branchCode>" — company and
-// branch are separated by the FIRST underscore, and the codes themselves are
-// hyphen-slugs (no underscores). Rather than hardcoding a map, we resolve
+// tenant as "<companyCode>" or "<companyCode>___<branchCode>" — company and
+// branch are separated by a TRIPLE underscore ("___"), and the codes
+// themselves are hyphen-slugs. Rather than hardcoding a map, we resolve
 // CompanyId / BranchId dynamically from Metabase lookup cards, so new companies
 // or branches need no code change here:
 //   card 41 -> companies (CompanyCode -> CompanyId)
@@ -57,12 +57,13 @@ export function slugify(s) {
     .replace(/^-+|-+$/g, "");
 }
 
-/** Split a workspace slug into { companyCode, branchCode } on the FIRST "_". */
+/** Split a workspace slug into { companyCode, branchCode } on the FIRST "___". */
 export function splitWorkspaceSlug(slug) {
+  const SEP = "___";
   const s = String(slug ?? "").trim();
-  const i = s.indexOf("_");
+  const i = s.indexOf(SEP);
   if (i === -1) return { companyCode: s, branchCode: null };
-  return { companyCode: s.slice(0, i), branchCode: s.slice(i + 1) || null };
+  return { companyCode: s.slice(0, i), branchCode: s.slice(i + SEP.length) || null };
 }
 
 /** Find a CompanyId whose slugified CompanyCode equals companySlug (already slugified). */

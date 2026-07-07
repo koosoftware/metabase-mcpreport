@@ -23,8 +23,9 @@ etc. will be added to the `CARDS` catalog in `metabase-core.js`.
 ## How it works
 
 1. AnythingLLM injects `workspace_slug` on every call. The slug encodes the
-   tenant as `<companyCode>` or `<companyCode>_<branchCode>` — split on the
-   **first** underscore (codes themselves are hyphen-slugs, e.g. `branch-001`).
+   tenant as `<companyCode>` or `<companyCode>___<branchCode>` — split on the
+   **first triple underscore** `___` (codes themselves are hyphen-slugs, e.g.
+   `branch-001`).
 2. The server resolves the tenant **dynamically from Metabase** (no hardcoded
    map), caching the lookups for 5 minutes:
    - Company: POST card **41**, slugify each `CompanyCode`, match the company
@@ -32,8 +33,8 @@ etc. will be added to the `CARDS` catalog in `metabase-core.js`.
    - Branch (only if present): POST card **42**, slugify each `BranchCode`,
      match the branch part **and** `CompanyId` (branch codes repeat across
      companies) → `BranchId`. No match → `invalid branch code`.
-   - So `demo` → DEMO company, whole-company view; `demo_kl001` → DEMO + KL001
-     branch; `qc_branch-001` → QC + Branch 1. New companies/branches work with
+   - So `demo` → DEMO company, whole-company view; `demo___kl001` → DEMO + KL001
+     branch; `qc___branch-001` → QC + Branch 1. New companies/branches work with
      no code change.
 3. The model supplies `start_date` / `end_date` from the user's intent.
 4. The server POSTs the Metabase `parameters` array (start_date, end_date,
