@@ -236,6 +236,25 @@ function formatInTz(utcIso, timeZone) {
   }
 }
 
+/**
+ * Return a shallow copy of a raw row with every "...AtUtc" timestamp converted
+ * to local time and renamed "...AtLocal". This is applied to sampleRows / raw
+ * rows so the model never sees an unconverted UTC value (which it would present
+ * as-is, i.e. as if it were local time).
+ */
+export function localizeRowTimestamps(row, timeZone) {
+  if (!row || typeof row !== "object") return row;
+  const out = {};
+  for (const [k, v] of Object.entries(row)) {
+    if (/AtUtc$/.test(k) && typeof v === "string") {
+      out[k.replace(/Utc$/, "Local")] = formatInTz(v, timeZone);
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
 /** seconds between two ISO timestamps, or null. Queue times are short, so we
  * report in whole seconds — reporting in 1-decimal minutes lost precision (e.g.
  * a true 55.8s average displayed as 0.9 min, which reads back as 54s). */
@@ -559,8 +578,12 @@ export async function fetchCard(cardKey, card, opts = {}) {
   // for context, and the full rows only when explicitly requested.
   if (card.summarize) {
     out.summary = card.summarize(rows, opts);
-    out.sampleRows = Array.isArray(rows) ? rows.slice(0, 3) : rows;
-    if (opts.include_rows) out.rows = rows;
+    // Convert UTC timestamps to the tenant's timezone (renamed *AtLocal) so the
+    // model never presents raw UTC as if it were local time.
+    const tz = opts.tenant?.time_zone || "UTC";
+    out.timeZone = tz;
+    out.sampleRows = Array.isArray(rows) ? rows.slice(0, 3).map((r) => localizeRowTimestamps(r, tz)) : rows;
+    if (opts.include_rows) out.rows = rows.map((r) => localizeRowTimestamps(r, tz));
   } else {
     out.rows = rows;
   }
