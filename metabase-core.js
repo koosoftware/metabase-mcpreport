@@ -168,6 +168,40 @@ export const CARDS = {
     // into a compact digest. (Function is hoisted, defined below.)
     summarize: summarizeTicketRows,
   },
+
+  appointment_summary: {
+    id: 43,
+    label: "Appointment Summary",
+    description:
+      "Summary of appointments booked/scheduled over a date range for the tenant — " +
+      "use for questions about appointment volume, statuses, no-shows, and scheduling.",
+    // Same template-tag parameters as the ticket card.
+    params: [
+      { name: "start_date", type: "date", source: "range" },
+      { name: "end_date", type: "date", source: "range" },
+      { name: "company_id", type: "text", source: "tenant" },
+      { name: "branch_id", type: "text", source: "tenant", optional: true },
+    ],
+    // Card 43 returns one row per appointment; aggregate server-side.
+    summarize: summarizeAppointmentRows,
+  },
+
+  rating_feedback: {
+    id: 44,
+    label: "Rating & Feedback",
+    description:
+      "Customer ratings and feedback over a date range for the tenant — use for " +
+      "questions about satisfaction scores, average rating, rating distribution, " +
+      "and written feedback/comments.",
+    params: [
+      { name: "start_date", type: "date", source: "range" },
+      { name: "end_date", type: "date", source: "range" },
+      { name: "company_id", type: "text", source: "tenant" },
+      { name: "branch_id", type: "text", source: "tenant", optional: true },
+    ],
+    // Card 44 returns one row per rating response; aggregate server-side.
+    summarize: summarizeRatingRows,
+  },
 };
 
 // --- Summarizers -------------------------------------------------------------
@@ -419,6 +453,273 @@ function summarizeTicketRows(rows, opts = {}) {
   // Per-ticket detail (issued/called/completed/waiting/serving per row) is only
   // included when explicitly requested, to keep the default summary compact.
   if (opts.detail) out.tickets = ticketDetail(rows, opts.detailCap || 200, timeZone);
+
+  return out;
+}
+
+// --- Appointment summarizer --------------------------------------------------
+
+/**
+ * Build a compact per-appointment detail table. Timestamps are converted from
+ * UTC to `timeZone`; StartTime/EndTime/AppointmentDate are already local values.
+ */
+function appointmentDetail(rows, cap, timeZone) {
+  const list = rows.slice(0, cap).map((r) => ({
+    code: r.AppointmentCode ?? null,
+    date: r.AppointmentDate ?? null,
+    start: r.StartTime ?? null,
+    end: r.EndTime ?? null,
+    status: r.Status ?? null,
+    service: r.ServiceName ?? null,
+    branch: r.BranchName ?? null,
+    customer: r.CustomerName ?? null,
+    phone: r.MobilePhoneNumber ?? null,
+    email: r.EmailAddress ?? null,
+    booked_at: formatInTz(r.CreatedAtUtc, timeZone),
+    checked_in_at: formatInTz(r.CheckedInAtUtc, timeZone),
+    linked_ticket: r.TicketId != null,
+  }));
+  return { count: rows.length, rows: list, truncated: rows.length > cap };
+}
+
+/**
+ * Aggregate raw appointment rows from card 43 into a compact summary.
+ *
+ * Row columns: AppointmentId, CompanyId, BranchId/Code/Name, ServiceId/Code/Name,
+ * TicketId (null unless the appointment converted to a ticket), AppointmentCode,
+ * AppointmentDate (local date), StartTime/EndTime (local time-of-day), Status,
+ * CustomerName/MobilePhoneNumber/EmailAddress/CustomerReference/Notes,
+ * CreatedAtUtc (booked), CheckedInAtUtc (attended), ReminderEmail* fields.
+ *
+ * One row = one appointment (AppointmentId is unique).
+ */
+function summarizeAppointmentRows(rows, opts = {}) {
+  if (!Array.isArray(rows)) return { note: "unexpected (non-array) response", raw: rows };
+  if (!rows.length) return { appointments: 0, note: "no appointments for this range" };
+
+  const first = rows[0] || {};
+  const timeZone = opts.tenant?.time_zone || "UTC";
+  const pct = (num, den) => (den ? Math.round((num / den) * 1000) / 10 : 0);
+
+  const checkedIn = rows.filter((r) => r.CheckedInAtUtc != null).length;
+  const remindersSent = rows.filter((r) => r.ReminderEmailSentAtUtc != null).length;
+  const linkedToTicket = rows.filter((r) => r.TicketId != null).length;
+
+  const codes = [...new Set(rows.map((r) => r.AppointmentCode).filter(Boolean))].sort();
+  const CODE_CAP = 300;
+
+  const out = {
+    context: {
+      company: first.CompanyName || first.CompanyCode || null,
+      branches: [...new Set(rows.map((r) => r.BranchName).filter(Boolean))],
+    },
+    time_zone: timeZone,
+    appointments: rows.length,
+    distinct_appointments: distinctCount(rows, "AppointmentId"),
+    distinct_services: distinctCount(rows, "ServiceId"),
+    distinct_branches: distinctCount(rows, "BranchId"),
+    by_status: tally(rows, "Status"),
+    by_service: tally(rows, "ServiceName"),
+    by_branch: tally(rows, "BranchName"),
+    by_appointment_date: tally(rows, "AppointmentDate"),
+    // Attendance = an appointment that was checked in (CheckedInAtUtc set).
+    attendance: {
+      checked_in: checkedIn,
+      total: rows.length,
+      rate_pct: pct(checkedIn, rows.length),
+    },
+    reminders_sent: remindersSent,
+    linked_to_ticket: linkedToTicket,
+    appointment_codes: {
+      count: codes.length,
+      list: codes.slice(0, CODE_CAP),
+      truncated: codes.length > CODE_CAP,
+    },
+  };
+
+  // Per-appointment detail (includes customer contact) only when requested.
+  if (opts.detail) out.appointments_detail = appointmentDetail(rows, opts.detailCap || 200, timeZone);
+
+  return out;
+}
+
+// --- Rating & feedback summarizer -------------------------------------------
+
+function hasText(v) {
+  return typeof v === "string" && v.trim() !== "";
+}
+
+/** Local date (YYYY-MM-DD) tally of a UTC timestamp column. */
+function tallyLocalDate(rows, tsKey, timeZone) {
+  const out = {};
+  for (const r of rows) {
+    const local = formatInTz(r?.[tsKey], timeZone); // "YYYY-MM-DD HH:mm:ss"
+    const d = typeof local === "string" && local.length >= 10 ? local.slice(0, 10) : "(none)";
+    out[d] = (out[d] || 0) + 1;
+  }
+  return out;
+}
+
+// Rating scale is fixed 1-5.
+const RATING_MIN = 1;
+const RATING_MAX = 5;
+
+/** Distribution over the fixed 1-5 scale (zero-filled); out-of-range values kept as-is. */
+function ratingDistribution(rows) {
+  const out = {};
+  for (let i = RATING_MIN; i <= RATING_MAX; i++) out[i] = 0;
+  for (const r of rows) {
+    const v = r.OverallRating;
+    if (typeof v === "number") out[v] = (out[v] || 0) + 1;
+  }
+  return out;
+}
+
+/** Safely parse a JSON-array string; returns [] on anything unexpected. */
+function parseJsonArray(s) {
+  if (Array.isArray(s)) return s;
+  if (typeof s !== "string") return [];
+  try {
+    const v = JSON.parse(s);
+    return Array.isArray(v) ? v : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Per-question averages across responses, using QuestionJson (id -> text/type)
+ * and AnswersJson ([{questionId, value}]). Numeric values are averaged; the
+ * question text comes from the linked rating template.
+ */
+function perQuestionStats(rows) {
+  const text = {}; // id -> question text
+  const type = {}; // id -> question type
+  const agg = {}; // id -> { n, vals[] }
+  for (const r of rows) {
+    for (const q of parseJsonArray(r.QuestionJson)) {
+      if (q && q.id != null && !(q.id in text)) {
+        text[q.id] = q.text || String(q.id);
+        type[q.id] = q.type || null;
+      }
+    }
+    for (const a of parseJsonArray(r.AnswersJson)) {
+      if (a && a.questionId != null) {
+        const g = (agg[a.questionId] = agg[a.questionId] || { n: 0, vals: [] });
+        g.n++;
+        if (typeof a.value === "number") g.vals.push(a.value);
+      }
+    }
+  }
+  return Object.entries(agg).map(([id, g]) => ({
+    question_id: id,
+    text: text[id] || id,
+    type: type[id] || null,
+    responses: g.n,
+    average: g.vals.length
+      ? Math.round((g.vals.reduce((a, b) => a + b, 0) / g.vals.length) * 100) / 100
+      : null,
+  }));
+}
+
+/** Core rating stats for a set of rows: response count, average (out of 5), distribution. */
+function ratingStats(rows) {
+  const vals = rows.map((r) => r.OverallRating).filter((v) => typeof v === "number");
+  const average_rating = vals.length
+    ? Math.round((vals.reduce((a, b) => a + b, 0) / vals.length) * 100) / 100
+    : null;
+  return {
+    responses: rows.length,
+    rated: vals.length,
+    average_rating, // out of RATING_MAX (5)
+    by_rating: ratingDistribution(rows),
+  };
+}
+
+/** Rating stats grouped by a column (e.g. branch). */
+function ratingByColumn(rows, key) {
+  const values = [...new Set(rows.map((r) => r?.[key]).filter(Boolean))];
+  const out = {};
+  for (const v of values) out[v] = ratingStats(rows.filter((r) => r?.[key] === v));
+  return out;
+}
+
+/** Per-response detail table (rating + feedback text + local submit time). */
+function ratingDetail(rows, cap, timeZone) {
+  const list = rows.slice(0, cap).map((r) => ({
+    rating: r.OverallRating ?? null,
+    feedback: hasText(r.FeedbackText) ? r.FeedbackText : null,
+    source: r.Source ?? null,
+    template: r.TemplateName ?? null,
+    branch: r.BranchName ?? null,
+    service: r.ServiceName ?? null,
+    ticket: r.TicketText ?? null,
+    submitted: formatInTz(r.SubmittedAtUtc, timeZone),
+  }));
+  return { count: rows.length, rows: list, truncated: rows.length > cap };
+}
+
+/**
+ * Aggregate raw rating responses from card 44 into a compact summary.
+ *
+ * Row columns: TicketRatingResponseId, CompanyId, BranchId/Code/Name,
+ * RatingTemplateId, TicketId, ServiceId/Code/Name, CounterId, OverallRating
+ * (numeric score), FeedbackText (free-text, may be null), AnswersJson (per-
+ * question answers), Source (e.g. PublicLink), SubmittedAtUtc, TicketText.
+ *
+ * One row = one rating response. The rating scale isn't hardcoded — we report
+ * the actual average and the distribution of whatever score values appear.
+ */
+function summarizeRatingRows(rows, opts = {}) {
+  if (!Array.isArray(rows)) return { note: "unexpected (non-array) response", raw: rows };
+  if (!rows.length) return { responses: 0, note: "no rating responses for this range" };
+
+  const first = rows[0] || {};
+  const timeZone = opts.tenant?.time_zone || "UTC";
+
+  const overall = ratingStats(rows);
+  const withFeedback = rows.filter((r) => hasText(r.FeedbackText));
+
+  // Compact feedback list (the qualitative point of this report), capped.
+  const FEEDBACK_CAP = 50;
+  const feedback = withFeedback.slice(0, FEEDBACK_CAP).map((r) => ({
+    rating: r.OverallRating ?? null,
+    branch: r.BranchName ?? null,
+    text: r.FeedbackText,
+  }));
+
+  const out = {
+    context: {
+      company: first.CompanyName || first.CompanyCode || null,
+      branches: [...new Set(rows.map((r) => r.BranchName).filter(Boolean))],
+    },
+    time_zone: timeZone,
+    rating_scale: { min: RATING_MIN, max: RATING_MAX },
+    responses: rows.length,
+    distinct_responses: distinctCount(rows, "TicketRatingResponseId"),
+    average_rating: overall.average_rating, // out of 5
+    rated_count: overall.rated,
+    by_rating: overall.by_rating, // distribution over 1-5 (zero-filled)
+    by_branch: tally(rows, "BranchName"),
+    by_service: tally(rows, "ServiceName", "(none)"),
+    by_source: tally(rows, "Source"),
+    by_date: tallyLocalDate(rows, "SubmittedAtUtc", timeZone),
+    // Average + distribution per branch.
+    by_branch_ratings: ratingByColumn(rows, "BranchName"),
+    // Which rating template(s) the responses came from.
+    by_template: tally(rows, "TemplateName"),
+    // Named per-question averages (from the template's QuestionJson + AnswersJson).
+    per_question: perQuestionStats(rows),
+    feedback_count: withFeedback.length,
+    feedback: {
+      count: withFeedback.length,
+      list: feedback,
+      truncated: withFeedback.length > FEEDBACK_CAP,
+    },
+  };
+
+  // Full per-response detail (rating + comment + submit time) when requested.
+  if (opts.detail) out.responses_detail = ratingDetail(rows, opts.detailCap || 200, timeZone);
 
   return out;
 }

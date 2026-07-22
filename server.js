@@ -33,14 +33,17 @@ function jsonContent(obj) {
 server.tool(
   "get_report",
   "Fetch a QMSCloud report from Metabase and analyze it to answer the user's " +
-    "question. Returns a compact `summary` (distinct tickets; breakdowns by status, " +
-    "service, branch, counter, business date; a `ticket_numbers` list; and waiting/" +
-    "serving-time stats) plus a few `sampleRows`. For questions that require listing " +
-    "individual tickets WITH their times, pass detail=true to also get a per-ticket " +
-    "table. Pass the exact `report` key (call list_reports if unsure). Supply " +
+    "question. Returns a compact `summary` (counts, breakdowns, and a codes list) " +
+    "plus a few `sampleRows`. For questions that require LISTING individual records " +
+    "(with their times / details), pass detail=true to also get a per-record table. " +
+    "Pass the exact `report` key (call list_reports if unsure). Supply " +
     "`start_date`/`end_date` as YYYY-MM-DD from the user's intent (defaults to current " +
     "month-to-date). The tenant (company/branch) is resolved automatically from the " +
-    "workspace — do not ask the user for it. Currently available: 'ticket_summary'.",
+    "workspace — do not ask the user for it. Available reports: 'ticket_summary' " +
+    "(queue tickets: status, service, branch, counter, waiting/serving time), " +
+    "'appointment_summary' (booked appointments: status, attendance/check-in rate, " +
+    "service, branch, appointment date), and 'rating_feedback' (customer ratings: " +
+    "average score, rating distribution, per-branch averages, and written feedback).",
   {
     report: z
       .string()
@@ -56,7 +59,7 @@ server.tool(
     detail: z
       .boolean()
       .optional()
-      .describe("Set true when the user wants to LIST individual tickets with their times (issued/called/completed, waiting/serving minutes). Adds a compact `summary.tickets` table. Default false (aggregates only)."),
+      .describe("Set true when the user wants to LIST individual records with their details (ticket times, or appointment schedule/customer). Adds a compact per-record table (`summary.tickets` or `summary.appointments_detail`). Default false (aggregates only)."),
     include_rows: z
       .boolean()
       .optional()
